@@ -144,6 +144,9 @@ def load_stats():
             data.setdefault("successful_downloads", 0)
             data.setdefault("failed_downloads", 0)
             data.setdefault("rejected_non_tiktok", 0)
+            data.setdefault("success_via_tikwm", 0)
+            data.setdefault("success_via_heavy_path", 0)
+            data.setdefault("heavy_path_attempts", 0)
             return data
         except Exception:
             pass
@@ -152,7 +155,10 @@ def load_stats():
         "total_requests": 0,
         "successful_downloads": 0,
         "failed_downloads": 0,
-        "rejected_non_tiktok": 0
+        "rejected_non_tiktok": 0,
+        "success_via_tikwm": 0,
+        "success_via_heavy_path": 0,
+        "heavy_path_attempts": 0
     }
 
 stats = load_stats()
@@ -182,6 +188,21 @@ def track_result(success: bool):
 
 def track_rejected():
     stats["rejected_non_tiktok"] += 1
+    save_stats()
+
+def track_tikwm_success():
+    """يسجل نجاح عن طريق TikWM (المسار الخفيف السريع)."""
+    stats["success_via_tikwm"] += 1
+    save_stats()
+
+def track_heavy_path_attempt():
+    """يسجل كل مرة نضطر نلجأ فيها للمسار الثقيل (yt-dlp + curl_cffi + Deno) بعد فشل TikWM."""
+    stats["heavy_path_attempts"] += 1
+    save_stats()
+
+def track_heavy_path_success():
+    """يسجل نجاح فعلي عن طريق المسار الثقيل تحديداً - عشان نعرف هل يستاهل نضحي بالاستقرار عشانه."""
+    stats["success_via_heavy_path"] += 1
     save_stats()
 
 # ================== إدارة الاشتراك الإجباري (نفس منطق ZenDown) ==================
@@ -264,8 +285,12 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     success = stats.get("successful_downloads", 0)
     failed = stats.get("failed_downloads", 0)
     rejected = stats.get("rejected_non_tiktok", 0)
+    tikwm_ok = stats.get("success_via_tikwm", 0)
+    heavy_attempts = stats.get("heavy_path_attempts", 0)
+    heavy_ok = stats.get("success_via_heavy_path", 0)
     total_dl = success + failed
     rate = (success / total_dl * 100) if total_dl > 0 else 0.0
+    tikwm_share = (tikwm_ok / success * 100) if success > 0 else 0.0
 
     uptime = now - BOT_START_TIME
     days = uptime.days
@@ -289,6 +314,12 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"❌ فاشلة         : {failed}\n"
         f"✅ معدل النجاح    : {rate:.1f}%\n"
         f"🚫 روابط مرفوضة (غير تيك توك) : {rejected}\n"
+        "───────────────\n\n"
+        "⚖️ <b>TikWM مقابل المسار الثقيل</b>\n"
+        "───────────────\n"
+        f"⚡️ نجاح عبر TikWM (الخفيف) : {tikwm_ok} ({tikwm_share:.1f}% من كل النجاح)\n"
+        f"🐢 محاولات لجأت للمسار الثقيل : {heavy_attempts}\n"
+        f"✅ نجاح فعلي بالمسار الثقيل : {heavy_ok}\n"
         "───────────────\n\n"
         f"⏰ <b>وقت التشغيل:</b> {days} يوم {hours} ساعة {minutes} دقيقة"
     )
@@ -481,6 +512,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 file_path = await asyncio.wait_for(run_blocking(_blocking_tiktok_via_tikwm, text, tikwm_out), timeout=60)
                 if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
                     success = True
+                    track_tikwm_success()
             except asyncio.TimeoutError:
                 logger.error("TikWM timed out after 60s")
                 file_path = None
@@ -490,12 +522,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # المسار الاحتياطي: yt-dlp + curl_cffi + Deno
             if not success:
+                track_heavy_path_attempt()
                 for attempt in range(3):
                     try:
                         yt_out = f"vdy_{sid}.%(ext)s"
                         file_path = await asyncio.wait_for(run_blocking(_blocking_download_yt_dlp, text, yt_out), timeout=90)
                         if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
                             success = True
+                            track_heavy_path_success()
                             break
                     except asyncio.TimeoutError:
                         logger.error(f"Attempt {attempt + 1} timed out after 90s")
@@ -587,3 +621,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
