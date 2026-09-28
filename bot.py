@@ -1,4 +1,6 @@
 import subprocess
+import signal
+import glob
 import sys
 import asyncio
 import logging
@@ -29,8 +31,6 @@ try:
         print(result.stderr[-3000:])
 except Exception as e:
     print(f"⚠️ فشل التحديث التلقائي: {e}")
-
-from yt_dlp import YoutubeDL
 
 try:
     import importlib.metadata as _im
@@ -118,18 +118,9 @@ else:
 # ================== ضبط التزامن - عشان البوت ما يعلق ولا يتجاوز الذاكرة ==================
 MAX_CONCURRENT_DOWNLOADS = 1
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
-UPLOAD_SEMAPHORE = asyncio.Semaphore(1)
-
 MAX_QUEUE_SIZE = 6
 _pending_downloads = 0
 _pending_lock = asyncio.Lock()
-
-import concurrent.futures
-BLOCKING_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="vdy-worker")
-
-async def run_blocking(func, *args):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(BLOCKING_EXECUTOR, func, *args)
 
 # ================== نظام الإحصائيات ==================
 STATS_FILE = "stats.json"
@@ -144,9 +135,6 @@ def load_stats():
             data.setdefault("successful_downloads", 0)
             data.setdefault("failed_downloads", 0)
             data.setdefault("rejected_non_tiktok", 0)
-            data.setdefault("success_via_tikwm", 0)
-            data.setdefault("success_via_heavy_path", 0)
-            data.setdefault("heavy_path_attempts", 0)
             return data
         except Exception:
             pass
@@ -155,10 +143,7 @@ def load_stats():
         "total_requests": 0,
         "successful_downloads": 0,
         "failed_downloads": 0,
-        "rejected_non_tiktok": 0,
-        "success_via_tikwm": 0,
-        "success_via_heavy_path": 0,
-        "heavy_path_attempts": 0
+        "rejected_non_tiktok": 0
     }
 
 stats = load_stats()
@@ -188,21 +173,6 @@ def track_result(success: bool):
 
 def track_rejected():
     stats["rejected_non_tiktok"] += 1
-    save_stats()
-
-def track_tikwm_success():
-    """يسجل نجاح عن طريق TikWM (المسار الخفيف السريع)."""
-    stats["success_via_tikwm"] += 1
-    save_stats()
-
-def track_heavy_path_attempt():
-    """يسجل كل مرة نضطر نلجأ فيها للمسار الثقيل (yt-dlp + curl_cffi + Deno) بعد فشل TikWM."""
-    stats["heavy_path_attempts"] += 1
-    save_stats()
-
-def track_heavy_path_success():
-    """يسجل نجاح فعلي عن طريق المسار الثقيل تحديداً - عشان نعرف هل يستاهل نضحي بالاستقرار عشانه."""
-    stats["success_via_heavy_path"] += 1
     save_stats()
 
 # ================== إدارة الاشتراك الإجباري (نفس منطق ZenDown) ==================
@@ -285,12 +255,8 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     success = stats.get("successful_downloads", 0)
     failed = stats.get("failed_downloads", 0)
     rejected = stats.get("rejected_non_tiktok", 0)
-    tikwm_ok = stats.get("success_via_tikwm", 0)
-    heavy_attempts = stats.get("heavy_path_attempts", 0)
-    heavy_ok = stats.get("success_via_heavy_path", 0)
     total_dl = success + failed
     rate = (success / total_dl * 100) if total_dl > 0 else 0.0
-    tikwm_share = (tikwm_ok / success * 100) if success > 0 else 0.0
 
     uptime = now - BOT_START_TIME
     days = uptime.days
@@ -314,12 +280,6 @@ async def show_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"❌ فاشلة         : {failed}\n"
         f"✅ معدل النجاح    : {rate:.1f}%\n"
         f"🚫 روابط مرفوضة (غير تيك توك) : {rejected}\n"
-        "───────────────\n\n"
-        "⚖️ <b>TikWM مقابل المسار الثقيل</b>\n"
-        "───────────────\n"
-        f"⚡️ نجاح عبر TikWM (الخفيف) : {tikwm_ok} ({tikwm_share:.1f}% من كل النجاح)\n"
-        f"🐢 محاولات لجأت للمسار الثقيل : {heavy_attempts}\n"
-        f"✅ نجاح فعلي بالمسار الثقيل : {heavy_ok}\n"
         "───────────────\n\n"
         f"⏰ <b>وقت التشغيل:</b> {days} يوم {hours} ساعة {minutes} دقيقة"
     )
@@ -359,111 +319,78 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(f"✅ تمت الإذاعة!\n\n- نجح: {success}\n- فشل: {failed}")
 
 # ================== منطق التحميل من تيك توك ==================
-def _get_urllib_opener():
-    if PROXY_URL:
-        proxy_handler = urllib.request.ProxyHandler({'http': PROXY_URL, 'https': PROXY_URL})
-        return urllib.request.build_opener(proxy_handler)
-    return urllib.request.build_opener()
+# التحميل يتم داخل عملية منفصلة (subprocess) بدل ثريد داخل البوت. السبب: yt-dlp + محرك Deno ياخذون
+# ذاكرة كبيرة، ولو علّقوا كان الثريد يضل شغال بالخلفية بعد ما نستسلم ونقدر نقتله. أما العملية
+# المنفصلة فنقتلها بالقوة (هي وكل اللي تفرّع منها) عند انتهاء المهلة أو لما الذاكرة تقرب من الحد.
+_WORKER_SCRIPT = r"""
+import sys, json
+from yt_dlp import YoutubeDL
+cfg = json.loads(sys.argv[1])
+opts = {
+    'format': 'best[ext=mp4]/best',
+    'outtmpl': cfg['out'],
+    'quiet': True,
+    'no_warnings': True,
+    'cookiefile': cfg.get('cookies'),
+    'proxy': cfg.get('proxy'),
+    'extractor_args': {'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}},
+    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'geo_bypass': True,
+    'nocheckcertificate': True,
+    'socket_timeout': 20,
+}
+with YoutubeDL(opts) as ydl:
+    info = ydl.extract_info(cfg['url'], download=True)
+    print('FILEPATH::' + ydl.prepare_filename(info))
+"""
 
-def _blocking_tiktok_via_tikwm(url, out_path):
-    """مسار سريع: يجيب رابط التحميل المباشر من خدمة TikWM الوسيطة، أسرع من yt-dlp غالباً."""
-    opener = _get_urllib_opener()
-    api_url = "https://www.tikwm.com/api/?url=" + urllib.request.quote(url, safe="")
-    req = urllib.request.Request(api_url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Referer': 'https://www.tikwm.com/',
-        'Accept': 'application/json, text/plain, */*'
-    })
+_active_workers = set()
+
+def _kill_proc_group(proc):
+    """يقتل العملية وكل اللي تفرّع منها (مثل Deno) بالقوة."""
     try:
-        with opener.open(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        raise Exception(f"HTTP {e.code} من TikWM")
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
-    if data.get("code") != 0 or "data" not in data:
-        raise Exception(f"TikWM API error: {data.get('msg', 'unknown')}")
-
-    media_url = data["data"].get("play") or data["data"].get("hdplay")
-    if not media_url:
-        raise Exception("TikWM: لا يوجد رابط فيديو بالرد")
-    if media_url.startswith("/"):
-        media_url = "https://www.tikwm.com" + media_url
-
-    dl_req = urllib.request.Request(media_url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Referer': 'https://www.tikwm.com/'
-    })
-    with urllib.request.urlopen(dl_req, timeout=60) as resp, open(out_path, "wb") as f:
-        f.write(resp.read())
-
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-        return out_path
-    raise Exception("TikWM: الملف الناتج فارغ")
-
-def _blocking_download_yt_dlp(url, out_path):
-    """المسار الاحتياطي: yt-dlp + curl_cffi (انتحال بصمة) + Deno (حل تحدي جافاسكريبت)."""
-    opts = {
-        'format': 'best[ext=mp4]/best',
-        'outtmpl': out_path,
-        'quiet': True,
-        'no_warnings': True,
-        'cookiefile': COOKIES_FILE,
-        'proxy': PROXY_URL,
-        'extractor_args': {'tiktok': {'api_hostname': ['api22-normal-c-useast2a.tiktokv.com']}},
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'geo_bypass': True,
-        'nocheckcertificate': True,
-        'socket_timeout': 20,
-    }
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info)
-
-def _blocking_upload_to_external_host(file_path):
-    """لو الفيديو أكبر من حد تليجرام (50 ميجا) - يرفعه لرابط تحميل مباشر بدل ما يفشل."""
-    import mimetypes
-    filename = os.path.basename(file_path)
-    mime_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
-    with open(file_path, 'rb') as f:
-        file_bytes = f.read()
-    boundary = uuid.uuid4().hex
-
-    def _body(fields, file_field_name):
-        parts = []
-        for name, value in fields.items():
-            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
-        parts.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field_name}"; filename="{filename}"\r\n'
-            f'Content-Type: {mime_type}\r\n\r\n'.encode() + file_bytes + b'\r\n'
-        )
-        parts.append(f'--{boundary}--\r\n'.encode())
-        return b''.join(parts)
-
+async def download_tiktok(url, out_tmpl, timeout=75, script=None):
+    script = script or _WORKER_SCRIPT
+    cfg = json.dumps({"url": url, "out": out_tmpl, "cookies": COOKIES_FILE, "proxy": PROXY_URL})
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", script, cfg,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        start_new_session=True
+    )
+    _active_workers.add(proc)
     try:
-        body = _body({'reqtype': 'fileupload'}, 'fileToUpload')
-        req = urllib.request.Request("https://catbox.moe/user/api.php", data=body,
-                                      headers={'Content-Type': f'multipart/form-data; boundary={boundary}'})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            result_url = resp.read().decode().strip()
-            if result_url.startswith('http'):
-                return result_url
-    except Exception as e:
-        logger.error(f"External host (catbox) failed: {e}")
-
-    try:
-        body = _body({}, 'file')
-        req = urllib.request.Request("https://0x0.st", data=body, headers={
-            'Content-Type': f'multipart/form-data; boundary={boundary}',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        })
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            result_url = resp.read().decode().strip()
-            if result_url.startswith('http'):
-                return result_url
-    except Exception as e:
-        logger.error(f"External host (0x0.st) failed: {e}")
-
-    raise Exception("فشلت كل خدمات الاستضافة الاحتياطية")
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            _kill_proc_group(proc)
+            raise
+        if proc.returncode != 0:
+            if proc.returncode == -signal.SIGKILL:
+                raise Exception("تم إيقاف التحميل لحماية الذاكرة")
+            lines = stderr.decode(errors="ignore").strip().splitlines()
+            reason = lines[-1] if lines else f"exit code {proc.returncode}"
+            raise Exception(reason[:600])
+        for line in reversed(stdout.decode(errors="ignore").splitlines()):
+            if line.startswith("FILEPATH::"):
+                return line[len("FILEPATH::"):].strip()
+        raise Exception("لم يرجع المحمّل مسار الملف")
+    finally:
+        _active_workers.discard(proc)
+        if proc.returncode is None:
+            _kill_proc_group(proc)
+            try:
+                await proc.wait()
+            except Exception:
+                pass
 
 def _is_tiktok_url(url: str) -> bool:
     return "tiktok.com" in url.lower()
@@ -506,52 +433,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with DOWNLOAD_SEMAPHORE:
-            # المسار الأول: TikWM (أسرع، خفيف على الذاكرة)
-            try:
-                tikwm_out = f"vdy_{sid}_tikwm.mp4"
-                file_path = await asyncio.wait_for(run_blocking(_blocking_tiktok_via_tikwm, text, tikwm_out), timeout=60)
-                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                    success = True
-                    track_tikwm_success()
-            except asyncio.TimeoutError:
-                logger.error("TikWM timed out after 60s")
-                file_path = None
-            except Exception as e:
-                logger.error(f"TikWM failed: {e}")
-                file_path = None
-
-            # المسار الاحتياطي: yt-dlp + curl_cffi + Deno
-            if not success:
-                track_heavy_path_attempt()
-                for attempt in range(3):
-                    try:
-                        yt_out = f"vdy_{sid}.%(ext)s"
-                        file_path = await asyncio.wait_for(run_blocking(_blocking_download_yt_dlp, text, yt_out), timeout=90)
-                        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                            success = True
-                            track_heavy_path_success()
-                            break
-                    except asyncio.TimeoutError:
-                        logger.error(f"Attempt {attempt + 1} timed out after 90s")
-                    except Exception as e:
-                        logger.error(f"Attempt {attempt + 1} failed: {e}")
-                    if attempt < 2:
-                        await asyncio.sleep(2)
+            for attempt in range(2):
+                try:
+                    file_path = await download_tiktok(text, f"vdy_{sid}.%(ext)s")
+                    if file_path and os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                        success = True
+                        break
+                except asyncio.TimeoutError:
+                    logger.error(f"Attempt {attempt + 1} timed out - العملية انقتلت بالقوة")
+                except Exception as e:
+                    logger.error(f"Attempt {attempt + 1} failed: {e}")
+                if attempt < 1:
+                    await asyncio.sleep(1)
 
         if success and file_path and os.path.exists(file_path):
             size_mb = os.path.getsize(file_path) / (1024 * 1024)
             if size_mb >= 49.5:
-                await status_msg.edit_text("📦 المقطع كبير، جاري رفعه لرابط تحميل مباشر...")
-                try:
-                    async with UPLOAD_SEMAPHORE:
-                        external_url = await run_blocking(_blocking_upload_to_external_host, file_path)
-                    await update.message.reply_text(f"✅ المقطع كبير ({size_mb:.1f} ميجا)، حمّله من هنا:\n{external_url}")
-                    track_result(True)
-                    await status_msg.delete()
-                except Exception as e:
-                    logger.error(f"External upload failed: {e}")
-                    await status_msg.edit_text("❌ تعذر رفع المقطع الكبير حالياً، حاول لاحقاً.")
-                    track_result(False)
+                await status_msg.edit_text(f"مقطع حجمه أكثر من 50 ميجا ({size_mb:.1f} ميجا) - يتجاوز حد تيليجرام للبوتات، ما نقدر نرسله للأسف.")
+                track_result(False)
             else:
                 await status_msg.edit_text("📤 جاري الإرسال...")
                 with open(file_path, 'rb') as f:
@@ -569,8 +468,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     finally:
-        if file_path and os.path.exists(file_path):
-            try: os.remove(file_path)
+        for leftover in glob.glob(f"vdy_{sid}*"):
+            try: os.remove(leftover)
             except Exception: pass
         async with _pending_lock:
             _pending_downloads -= 1
@@ -582,19 +481,48 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     logger.error(f"استثناء غير متوقع (Unhandled): {context.error}\n{tb_string[-1500:]}")
 
 # ================== حارس الذاكرة ==================
+# القديم كان يقيس ذاكرة عملية البوت لحاله، وما يشوف ذاكرة Deno/yt-dlp (عمليات منفصلة) اللي هي الأثقل.
+# الحين يجمع ذاكرة كل العمليات داخل الحاوية (نفس اللي يحاسب عليها Render تقريباً).
+MEMORY_KILL_WORKERS_MB = float(os.environ.get("MEMORY_KILL_MB", "440"))  # فوقها: نقتل التحميل الجاري
+MEMORY_EXIT_SELF_MB = float(os.environ.get("MEMORY_EXIT_MB", "380"))     # ذاكرة البوت لحاله فوقها: إعادة تشغيل
+
+def _read_rss_mb(pid):
+    try:
+        with open(f'/proc/{pid}/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0.0
+
+def _container_rss_mb():
+    total = 0.0
+    try:
+        for entry in os.listdir('/proc'):
+            if entry.isdigit():
+                total += _read_rss_mb(entry)
+    except Exception:
+        pass
+    return total
+
 async def _memory_watchdog():
-    THRESHOLD_MB = 400
+    tick = 0
     while True:
-        await asyncio.sleep(15)
+        await asyncio.sleep(5)
+        tick += 1
         try:
-            with open('/proc/self/status') as f:
-                for line in f:
-                    if line.startswith('VmRSS:'):
-                        rss_mb = int(line.split()[1]) / 1024
-                        if rss_mb >= THRESHOLD_MB:
-                            logger.error(f"Memory watchdog: {rss_mb:.0f}MB تجاوزت الحد - إعادة تشغيل منظمة.")
-                            os._exit(0)
-                        break
+            own = _read_rss_mb('self')
+            total = _container_rss_mb()
+            if _active_workers and tick % 3 == 0:
+                logger.info(f"Memory: container={total:.0f}MB own={own:.0f}MB workers={len(_active_workers)}")
+            if own >= MEMORY_EXIT_SELF_MB:
+                logger.error(f"Memory watchdog: البوت لحاله {own:.0f}MB - إعادة تشغيل منظمة.")
+                os._exit(0)
+            if total >= MEMORY_KILL_WORKERS_MB and _active_workers:
+                logger.error(f"Memory watchdog: الحاوية {total:.0f}MB - قتل {len(_active_workers)} عملية تحميل لحماية البوت.")
+                for p in list(_active_workers):
+                    _kill_proc_group(p)
         except Exception as e:
             logger.error(f"Memory watchdog check failed: {e}")
 
